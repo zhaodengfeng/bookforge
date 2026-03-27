@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Translate Markdown files with chunking, parallel execution, and resume support.
+"""Translate Markdown files with structure-aware chunking, parallel execution, and resume support.
 
 Usage:
     python3 translate_md.py <input.md> <output.md> --engine deepl --target zh [--workers 4]
 
-Engines: deepl, openai, gemini, claude
+Engines: deepl, openai, gemini, claude, openrouter
 """
 
 import sys
@@ -21,45 +21,265 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from translator import get_engine, get_lang_name, ENGINES
 
 
-def split_into_chunks(md_text: str, max_chars: int = 3000) -> list[dict]:
-    """Split markdown into translatable chunks, preserving structure.
+# ---------------------------------------------------------------------------
+# Structure-aware Markdown chunking
+# ---------------------------------------------------------------------------
 
-    Strategy:
-    - Split on H1/H2 headings first (chapter boundaries)
-    - If a section is still too large, split on H3 or paragraphs
-    - Never split inside code blocks or tables
+def parse_structural_blocks(md_text: str) -> list[dict]:
+    """Parse markdown into structural blocks that should not be split.
+
+    Returns a list of dicts: {"type": str, "text": str, "level": int|None}
+    Types: heading, code_block, table, paragraph, list, blockquote, blank
     """
-    chunks = []
-    # Split on H1/H2 boundaries
-    sections = re.split(r'(?=^#{1,2} )', md_text, flags=re.MULTILINE)
+    blocks = []
+    lines = md_text.split('\n')
+    i = 0
 
-    for section in sections:
-        section = section.strip()
-        if not section:
+    while i < len(lines):
+        line = lines[i]
+
+        # Code block (fenced)
+        if line.strip().startswith('```'):
+            block_lines = [line]
+            i += 1
+            while i < len(lines):
+                block_lines.append(lines[i])
+                if lines[i].strip().startswith('```') and len(block_lines) > 1:
+                    i += 1
+                    break
+                i += 1
+            blocks.append({"type": "code_block", "text": '\n'.join(block_lines), "level": None})
             continue
 
-        if len(section) <= max_chars:
-            chunks.append(section)
+        # Heading
+        m = re.match(r'^(#{1,6}) ', line)
+        if m:
+            blocks.append({"type": "heading", "text": line, "level": len(m.group(1))})
+            i += 1
+            continue
+
+        # Table (line starts with |)
+        if line.strip().startswith('|'):
+            block_lines = []
+            while i < len(lines) and lines[i].strip().startswith('|'):
+                block_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "table", "text": '\n'.join(block_lines), "level": None})
+            continue
+
+        # Blockquote
+        if line.strip().startswith('>'):
+            block_lines = []
+            while i < len(lines) and (lines[i].strip().startswith('>') or
+                                       (lines[i].strip() and block_lines and not lines[i].strip().startswith('#'))):
+                block_lines.append(lines[i])
+                if not lines[i].strip().startswith('>'):
+                    break
+                i += 1
+            blocks.append({"type": "blockquote", "text": '\n'.join(block_lines), "level": None})
+            continue
+
+        # List item (- or * or numbered)
+        if re.match(r'^(\s*[-*+]|\s*\d+\.) ', line):
+            block_lines = []
+            while i < len(lines) and (re.match(r'^(\s*[-*+]|\s*\d+\.) ', lines[i]) or
+                                       (lines[i].strip() and lines[i].startswith('  '))):
+                block_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "list", "text": '\n'.join(block_lines), "level": None})
+            continue
+
+        # Blank line
+        if not line.strip():
+            blocks.append({"type": "blank", "text": "", "level": None})
+            i += 1
+            continue
+
+        # Paragraph — collect consecutive non-blank, non-special lines
+        block_lines = []
+        while i < len(lines):
+            l = lines[i]
+            if (not l.strip() or l.strip().startswith('```') or
+                re.match(r'^#{1,6} ', l) or l.strip().startswith('|') or
+                l.strip().startswith('>') or re.match(r'^(\s*[-*+]|\s*\d+\.) ', l)):
+                break
+            block_lines.append(l)
+            i += 1
+        if block_lines:
+            blocks.append({"type": "paragraph", "text": '\n'.join(block_lines), "level": None})
+
+    return blocks
+
+
+def force_split_block(block_text: str, max_chars: int) -> list[str]:
+    """Force-split an oversized block, preserving code fence markers."""
+    is_code = block_text.strip().startswith('```')
+
+    if is_code:
+        # Extract language tag from opening fence
+        first_line = block_text.split('\n')[0]
+        lang_tag = first_line.strip()
+        inner_lines = block_text.split('\n')[1:]
+        # Remove closing fence if present
+        if inner_lines and inner_lines[-1].strip().startswith('```'):
+            inner_lines = inner_lines[:-1]
+
+        chunks = []
+        current = []
+        current_len = 0
+        for line in inner_lines:
+            if current_len + len(line) + 1 > max_chars - 20:  # Reserve space for fences
+                chunks.append(f"{lang_tag}\n" + '\n'.join(current) + "\n```")
+                current = [line]
+                current_len = len(line)
+            else:
+                current.append(line)
+                current_len += len(line) + 1
+        if current:
+            chunks.append(f"{lang_tag}\n" + '\n'.join(current) + "\n```")
+        return chunks
+
+    # Non-code: split on paragraph boundaries or lines
+    paragraphs = block_text.split('\n\n')
+    if len(paragraphs) > 1:
+        chunks = []
+        buffer = ""
+        for para in paragraphs:
+            if len(buffer) + len(para) + 2 <= max_chars:
+                buffer = f"{buffer}\n\n{para}" if buffer else para
+            else:
+                if buffer:
+                    chunks.append(buffer)
+                buffer = para
+        if buffer:
+            chunks.append(buffer)
+        return chunks
+
+    # Last resort: split by lines
+    chunks = []
+    buffer = ""
+    for line in block_text.split('\n'):
+        if len(buffer) + len(line) + 1 <= max_chars:
+            buffer = f"{buffer}\n{line}" if buffer else line
         else:
-            # Further split on H3 or double newlines
-            subsections = re.split(r'(?=^### )|(?:\n\n)', section, flags=re.MULTILINE)
-            buffer = ""
-            for sub in subsections:
-                sub = sub.strip()
-                if not sub:
-                    continue
-                if len(buffer) + len(sub) + 2 <= max_chars:
-                    buffer = f"{buffer}\n\n{sub}" if buffer else sub
-                else:
-                    if buffer:
-                        chunks.append(buffer)
-                    # If single subsection is too large, just add it as-is
-                    buffer = sub
             if buffer:
                 chunks.append(buffer)
+            buffer = line
+    if buffer:
+        chunks.append(buffer)
+    return chunks
 
-    return [{"index": i, "text": c, "hash": hashlib.sha256(c.encode()).hexdigest()[:12]} for i, c in enumerate(chunks)]
 
+def merge_blocks_to_chunks(blocks: list[dict], max_chars: int = 3000) -> list[str]:
+    """Merge structural blocks into translation chunks, preferring heading boundaries."""
+    chunks = []
+    buffer = ""
+
+    for block in blocks:
+        if block["type"] == "blank":
+            buffer += "\n\n" if buffer else ""
+            continue
+
+        text = block["text"]
+
+        # If this block alone exceeds max, force-split it
+        if len(text) > max_chars * 2:
+            if buffer.strip():
+                chunks.append(buffer.strip())
+                buffer = ""
+            chunks.extend(force_split_block(text, max_chars))
+            continue
+
+        # Prefer to split at heading boundaries
+        if block["type"] == "heading" and block["level"] and block["level"] <= 2:
+            if buffer.strip():
+                chunks.append(buffer.strip())
+                buffer = ""
+
+        if len(buffer) + len(text) + 2 <= max_chars:
+            buffer = f"{buffer}\n\n{text}" if buffer.strip() else text
+        else:
+            if buffer.strip():
+                chunks.append(buffer.strip())
+            buffer = text
+
+    if buffer.strip():
+        chunks.append(buffer.strip())
+
+    return chunks
+
+
+def split_into_chunks(md_text: str, max_chars: int = 3000) -> list[dict]:
+    """Split markdown into translatable chunks using structure-aware parsing.
+
+    Strategy:
+    - Parse into structural blocks (headings, code blocks, tables, lists, paragraphs)
+    - Never split inside code blocks or tables
+    - Prefer splitting at H1/H2 heading boundaries
+    - Force-split oversized blocks with fence-marker preservation
+    """
+    blocks = parse_structural_blocks(md_text)
+    chunk_texts = merge_blocks_to_chunks(blocks, max_chars)
+
+    return [{"index": i, "text": c, "hash": hashlib.sha256(c.encode()).hexdigest()[:12]}
+            for i, c in enumerate(chunk_texts)]
+
+
+# ---------------------------------------------------------------------------
+# Manifest-based integrity verification
+# ---------------------------------------------------------------------------
+
+def create_manifest(chunks: list[dict], source_path: str) -> dict:
+    """Create a manifest for chunk verification."""
+    with open(source_path, "rb") as f:
+        source_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+
+    return {
+        "source_file": source_path,
+        "source_hash": source_hash,
+        "chunk_count": len(chunks),
+        "chunks": {
+            c["hash"]: {
+                "index": c["index"],
+                "source_hash": c["hash"],
+                "char_count": len(c["text"]),
+            }
+            for c in chunks
+        }
+    }
+
+
+def validate_results(chunks: list[dict], results: list[dict], manifest: dict) -> list[str]:
+    """Validate translation results against manifest. Returns list of warnings."""
+    warnings = []
+
+    for i, (chunk, result) in enumerate(zip(chunks, results)):
+        if result is None:
+            warnings.append(f"Chunk {i}: missing result")
+            continue
+
+        if "error" in result:
+            warnings.append(f"Chunk {i}: translation error — {result['error']}")
+            continue
+
+        translated = result.get("translated", "")
+        source_len = len(chunk["text"])
+        trans_len = len(translated)
+
+        # Flag suspiciously small translations (<10% of source)
+        if source_len > 100 and trans_len < source_len * 0.1:
+            warnings.append(f"Chunk {i}: output suspiciously small ({trans_len} chars vs {source_len} source)")
+
+        # Flag empty translations
+        if not translated.strip():
+            warnings.append(f"Chunk {i}: empty translation output")
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Translation execution
+# ---------------------------------------------------------------------------
 
 def load_progress(progress_file: str) -> dict:
     """Load translation progress from file."""
@@ -85,7 +305,7 @@ def translate_chunk(engine, chunk: dict, target_lang: str, progress: dict, progr
         return chunk
 
     try:
-        translated = engine.translate(chunk["text"], get_lang_name(target_lang))
+        translated = engine.translate(chunk["text"], target_lang)
         chunk["translated"] = translated
         progress[chunk_key] = {"done": True, "text": translated}
         save_progress(progress_file, progress)
@@ -112,9 +332,12 @@ def translate_markdown(input_path: str, output_path: str, engine_name: str,
     print(f"Engine: {engine.name}", file=sys.stderr)
     print(f"Target language: {get_lang_name(target_lang)}", file=sys.stderr)
 
-    # Split into chunks
+    # Split into chunks (structure-aware)
     chunks = split_into_chunks(md_text, max_chars=max_chars)
     print(f"Chunks: {len(chunks)}", file=sys.stderr)
+
+    # Create manifest for verification
+    manifest = create_manifest(chunks, input_path)
 
     # Progress file for resume support
     base = os.path.splitext(output_path)[0]
@@ -157,6 +380,13 @@ def translate_markdown(input_path: str, output_path: str, engine_name: str,
                 results[idx]["translated"] = chunks[idx]["text"]
                 errors += 1
 
+    # Validate results
+    warnings = validate_results(chunks, results, manifest)
+    if warnings:
+        print(f"\nValidation warnings:", file=sys.stderr)
+        for w in warnings:
+            print(f"  ⚠ {w}", file=sys.stderr)
+
     # Merge translated chunks
     translated_parts = []
     for r in results:
@@ -171,11 +401,17 @@ def translate_markdown(input_path: str, output_path: str, engine_name: str,
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(translated_text)
 
+    # Save manifest alongside output
+    manifest_path = f"{base}.manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
     # Clean up progress file on success
     if errors == 0 and os.path.exists(progress_file):
         os.remove(progress_file)
 
     print(f"\nOutput: {output_path} ({len(translated_text)} chars)", file=sys.stderr)
+    print(f"Manifest: {manifest_path}", file=sys.stderr)
     if errors > 0:
         print(f"Warnings: {errors} chunks had errors (original text used as fallback)", file=sys.stderr)
         print(f"Progress saved to {progress_file} — re-run to retry failed chunks", file=sys.stderr)

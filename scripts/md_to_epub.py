@@ -181,12 +181,13 @@ def convert_md_to_epub(md_path, output_path, title=None, author=None, lang="zh-C
         "pandoc",
         preprocessed_path,
         "-o", output_path,
-        "--epub-css", css_path,
+        "--css", css_path,
         "--metadata", f"title={title}",
         "--metadata", f"lang={lang}",
         "--toc",
         "--toc-depth=3",
         "--split-level=2",
+        "--epub-title-page=false",
     ]
 
     if author:

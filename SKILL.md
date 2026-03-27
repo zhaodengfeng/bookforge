@@ -123,6 +123,50 @@ Set the relevant environment variable for your chosen engine:
 - Claude: `export ANTHROPIC_API_KEY=your_key`
 - OpenRouter: `export OPENROUTER_API_KEY=your_key`
 
+## Known Pitfalls (Post-extraction Cleanup)
+
+PDF extraction + translation introduces many subtle formatting bugs. When writing cleanup scripts, watch for these:
+
+### 1. Markdown Setext Headings (CRITICAL)
+`---` separators in the body text cause Setext heading bugs: any text line immediately before `---` becomes an H2 heading (wrong font/size). **Fix:** Remove ALL `---` from body content with `re.sub(r'\n---\n', '\n\n', content)`. Do this early in the pipeline.
+
+### 2. Split Headings from PDF Extraction
+PDF line breaks often split one heading into two `# ` lines (e.g., `# 唯有一人疯狂到足以` / `# 太空` should be one heading). **Fix:** Compare with table of contents entries to get correct full titles, then `content.replace()` to merge them.
+
+### 3. Markdown Newline = Space in HTML
+A single newline between text lines becomes a visible space in rendered HTML/PDF. For Chinese text, this creates unwanted gaps. **Fix:** Join consecutive body text lines into single lines. For CJK text, join without space; for English, join with space. Must detect block-level elements (headings, lists, bold markers, blank lines) to avoid joining those.
+
+### 4. Unicode Superscript Rendering
+Unicode superscript digits (⁰¹²³⁴⁵⁶⁷⁸⁹) render as □ boxes in many Chinese fonts (e.g., FZFangSong-Z02). **Fix:** In the HTML/PDF generation step, convert Unicode superscripts to `<sup>regular digits</sup>` with a fallback font (e.g., PingFang SC) in CSS.
+
+### 5. Footnote Numbers Mixed with Content
+PDF extraction often merges footnote reference numbers with body text (e.g., `9831971年` where `983` is a footnote and `1971年` is content). **Fix:** Clean with `re.sub(r'(\d{3})(\d{4}年)', r'\2', content)` before any line-joining step.
+
+### 6. False Headings from `###` Prefix
+PDF extraction may incorrectly mark body text lines with `### ` prefix. **Fix:** After the TOC section, strip `### ` from lines that look like body text (contain sentence punctuation, length > 30 chars).
+
+### 7. Regex `[^X]` Matches Newlines
+In Python regex, character class negation `[^*]` matches `\n` (unlike `.` which doesn't by default). This causes patterns like `\*\*[^*]+\*\*` to match across multiple lines, mangling content. **Fix:** Always use `[^*\n]+` when you intend single-line matching in character classes.
+
+### 8. `re.DOTALL` Leaks into Heading Patterns
+When using `re.DOTALL` for a multi-line search, `.*` in heading patterns like `## .*keyword.*\n\n` will match across lines, capturing wrong sections. **Fix:** Use `[^\n]*` instead of `.*` for heading-line patterns within DOTALL regexes.
+
+### 9. Line-Joining Destroys Numbered Lists and Timelines
+The continuation-line joiner merges numbered items (`1. text`, `2. text`) and year entries (`1971年...`) into one giant line. **Fix:** Detect these patterns as block-level elements in the joiner: `re.match(r'^\d{1,2}\. ', line)` for numbered lists, `re.match(r'^\d{4}年', line)` for timelines. Add blank lines between items before joining.
+
+### 10. Processing Order Matters
+Cleanup steps interact with each other. Recommended order:
+1. Fix split headings and heading structure
+2. Remove `---` separators (prevent Setext headings)
+3. Strip false `###` headings
+4. Extract/convert footnote numbers
+5. Clean footnote digits mixed with content (e.g., before year entries)
+6. **Add blank lines between list items / year entries** (before joining!)
+7. Remove extra spaces (with URL protection)
+8. Merge split paragraphs
+9. Join continuation lines (the key rendering fix)
+10. Section-specific formatting (books, names, etc.) — use `[^*\n]` in regexes
+
 ## Notes
 - Default language is `zh-CN` for Chinese content; use `--lang en` for English
 - Output files default to `/tmp/` for easy sending via Telegram

@@ -76,10 +76,11 @@ class OpenAIEngine(TranslationEngine):
     def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
+        lang_name = get_lang_name(target_lang)
         payload = json.dumps({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": f"You are a professional translator. Translate the following text to {target_lang}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else."},
+                {"role": "system", "content": f"You are a professional translator. Translate the following text to {lang_name}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else."},
                 {"role": "user", "content": text},
             ],
             "temperature": 0.3,
@@ -114,9 +115,10 @@ class GeminiEngine(TranslationEngine):
     def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
+        lang_name = get_lang_name(target_lang)
         payload = json.dumps({
             "contents": [{
-                "parts": [{"text": f"You are a professional translator. Translate the following text to {target_lang}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else.\n\n{text}"}]
+                "parts": [{"text": f"You are a professional translator. Translate the following text to {lang_name}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else.\n\n{text}"}]
             }],
             "generationConfig": {"temperature": 0.3},
         }).encode()
@@ -147,11 +149,12 @@ class ClaudeEngine(TranslationEngine):
     def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
+        lang_name = get_lang_name(target_lang)
         payload = json.dumps({
             "model": self.model,
             "max_tokens": 8192,
             "messages": [
-                {"role": "user", "content": f"You are a professional translator. Translate the following text to {target_lang}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else.\n\n{text}"},
+                {"role": "user", "content": f"You are a professional translator. Translate the following text to {lang_name}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else.\n\n{text}"},
             ],
             "temperature": 0.3,
         }).encode()
@@ -194,10 +197,11 @@ class OpenRouterEngine(TranslationEngine):
     def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
+        lang_name = get_lang_name(target_lang)
         payload = json.dumps({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": f"You are a professional translator. Translate the following text to {target_lang}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else."},
+                {"role": "system", "content": f"You are a professional translator. Translate the following text to {lang_name}. Preserve all markdown formatting, code blocks, and special characters. Only output the translated text, nothing else."},
                 {"role": "user", "content": text},
             ],
             "temperature": 0.3,
