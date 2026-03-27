@@ -5,20 +5,40 @@ import os
 import sys
 import json
 import re
+import time
+import urllib.error
 from abc import ABC, abstractmethod
 
 
 class TranslationEngine(ABC):
     """Base class for translation engines."""
 
+    max_retries: int = 3
+
     @abstractmethod
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         pass
 
     @property
     @abstractmethod
     def name(self) -> str:
         pass
+
+    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+        """Translate with exponential backoff retry on transient errors."""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return self._translate_once(text, target_lang, source_lang)
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
+                last_error = e
+                # Don't retry on client errors (4xx) except 429 (rate limit)
+                if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code != 429:
+                    raise
+                wait = 2 ** attempt
+                print(f"  [retry {attempt + 1}/{self.max_retries}] {type(e).__name__}: {e} — waiting {wait}s", file=sys.stderr)
+                time.sleep(wait)
+        raise last_error
 
 
 class DeepLEngine(TranslationEngine):
@@ -40,7 +60,7 @@ class DeepLEngine(TranslationEngine):
     def name(self) -> str:
         return "DeepL"
 
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
         import urllib.parse
 
@@ -73,7 +93,7 @@ class OpenAIEngine(TranslationEngine):
     def name(self) -> str:
         return f"OpenAI ({self.model})"
 
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
         lang_name = get_lang_name(target_lang)
@@ -112,7 +132,7 @@ class GeminiEngine(TranslationEngine):
     def name(self) -> str:
         return f"Gemini ({self.model})"
 
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
         lang_name = get_lang_name(target_lang)
@@ -146,7 +166,7 @@ class ClaudeEngine(TranslationEngine):
     def name(self) -> str:
         return f"Claude ({self.model})"
 
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
         lang_name = get_lang_name(target_lang)
@@ -194,7 +214,7 @@ class OpenRouterEngine(TranslationEngine):
     def name(self) -> str:
         return f"OpenRouter ({self.model})"
 
-    def translate(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+    def _translate_once(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
         import urllib.request
 
         lang_name = get_lang_name(target_lang)

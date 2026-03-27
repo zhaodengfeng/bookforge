@@ -44,10 +44,21 @@ def extract_with_pdfplumber(pdf_path):
     return "\n".join(md_parts)
 
 
-def _chars_to_markdown_lines(chars):
+# Default heading detection thresholds (font size ratio relative to median)
+HEADING_THRESHOLDS = {
+    "h1": 1.8,       # ratio >= 1.8 → H1
+    "h2": 1.4,       # ratio >= 1.4 → H2
+    "h3": 1.15,      # ratio >= 1.15 → H3
+    "h3_bold": 1.05,  # bold + ratio >= 1.05 → H3
+}
+
+
+def _chars_to_markdown_lines(chars, heading_thresholds=None):
     """Group characters into lines and detect headings based on font size."""
     if not chars:
         return []
+
+    thresholds = {**HEADING_THRESHOLDS, **(heading_thresholds or {})}
 
     # Group chars by approximate y-position (same line)
     lines_dict = {}
@@ -95,11 +106,11 @@ def _chars_to_markdown_lines(chars):
 
         ratio = avg_size / normal_size if normal_size > 0 else 1
 
-        if ratio >= 1.8:
+        if ratio >= thresholds["h1"]:
             text = f"# {text}"
-        elif ratio >= 1.4:
+        elif ratio >= thresholds["h2"]:
             text = f"## {text}"
-        elif ratio >= 1.15 or (is_bold and ratio >= 1.05):
+        elif ratio >= thresholds["h3"] or (is_bold and ratio >= thresholds["h3_bold"]):
             text = f"### {text}"
         elif is_bold and len(text) < 100:
             text = f"**{text}**"
@@ -165,20 +176,58 @@ def extract_with_pypdf(pdf_path):
     return "\n".join(md_parts)
 
 
-def extract_with_ocr(pdf_path):
-    """Fallback for scanned PDFs: use OCR."""
-    from pdf2image import convert_from_path
+def _ocr_single_page(args):
+    """OCR a single page image. Used by multiprocessing pool."""
     import pytesseract
+    idx, image_path, lang = args
+    from PIL import Image
+    image = Image.open(image_path)
+    text = pytesseract.image_to_string(image, lang=lang)
+    return idx, text.strip() if text else ""
+
+
+def extract_with_ocr(pdf_path, ocr_lang="chi_sim+eng", ocr_workers=None):
+    """Fallback for scanned PDFs: use OCR with batch multiprocessing."""
+    from pdf2image import convert_from_path
+    import tempfile
+    from multiprocessing import Pool, cpu_count
 
     images = convert_from_path(pdf_path, dpi=300)
-    md_parts = []
 
+    # Save images to temp files for multiprocessing (PIL images can't be pickled)
+    temp_dir = tempfile.mkdtemp(prefix="bookforge_ocr_")
+    temp_paths = []
     for i, image in enumerate(images):
+        path = os.path.join(temp_dir, f"page_{i:04d}.png")
+        image.save(path)
+        temp_paths.append((i, path, ocr_lang))
+
+    workers = ocr_workers or min(cpu_count(), len(images), 4)
+    print(f"OCR: {len(images)} pages with {workers} workers", file=sys.stderr)
+
+    results = {}
+    with Pool(processes=workers) as pool:
+        for idx, text in pool.imap_unordered(_ocr_single_page, temp_paths):
+            results[idx] = text
+
+    # Clean up temp files
+    for _, path, _ in temp_paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(temp_dir)
+    except OSError:
+        pass
+
+    # Assemble in order
+    md_parts = []
+    for i in range(len(images)):
         if i > 0:
             md_parts.append("\n---\n")
-        text = pytesseract.image_to_string(image, lang="chi_sim+eng")
-        if text:
-            md_parts.append(text.strip())
+        if results.get(i):
+            md_parts.append(results[i])
 
     return "\n".join(md_parts)
 
